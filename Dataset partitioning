@@ -1,0 +1,81 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from joblib import dump
+
+class SlidingWindowDataLoaderSimple:
+    def __init__(self, file_path, target_col='IMF_2', window_size=8, save_dir='npy_data'):
+        self.file_path = file_path
+        self.target_col = target_col
+        self.window_size = window_size
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+       
+        self.data = pd.read_csv(file_path)
+        assert 'datetime' in self.data.columns, "缺少 datetime 列"
+        self.data['datetime'] = pd.to_datetime(self.data['datetime'])
+        self.data = self.data.sort_values(by='datetime')
+
+   
+        self.feature_cols = [col for col in self.data.columns if col != 'datetime']
+
+   
+        total_len = len(self.data)
+        train_size = int(total_len * 0.7)
+        val_size = int(total_len * 0.15)
+
+        self.train_df = self.data.iloc[:train_size].reset_index(drop=True)
+        self.val_df = self.data.iloc[train_size:train_size + val_size].reset_index(drop=True)
+        self.test_df = self.data.iloc[train_size + val_size:].reset_index(drop=True)
+
+     
+        self.scaler_X = MinMaxScaler()
+        self.scaler_y = StandardScaler()
+
+    def _create_sliding_window(self, X, y):
+        X_seq, y_seq = [], []
+        for i in range(len(X) - self.window_size):
+            X_seq.append(X[i:i + self.window_size])
+            y_seq.append(y[i + self.window_size])  
+        return np.array(X_seq), np.array(y_seq)
+
+    def process_and_save(self):
+        
+        X_train_raw = self.scaler_X.fit_transform(self.train_df[self.feature_cols])
+        y_train_raw = self.scaler_y.fit_transform(self.train_df[[self.target_col]]).flatten()
+        X_val_raw = self.scaler_X.transform(self.val_df[self.feature_cols])
+        y_val_raw = self.scaler_y.transform(self.val_df[[self.target_col]]).flatten()
+        X_test_raw = self.scaler_X.transform(self.test_df[self.feature_cols])
+        y_test_raw = self.scaler_y.transform(self.test_df[[self.target_col]]).flatten()
+
+      
+        X_train, y_train = self._create_sliding_window(X_train_raw, y_train_raw)
+        X_val, y_val = self._create_sliding_window(X_val_raw, y_val_raw)
+        X_test, y_test = self._create_sliding_window(X_test_raw, y_test_raw)
+
+        # 保存
+        np.save(f"{self.save_dir}/X_train.npy", X_train)
+        np.save(f"{self.save_dir}/y_train.npy", y_train)
+        np.save(f"{self.save_dir}/X_val.npy", X_val)
+        np.save(f"{self.save_dir}/y_val.npy", y_val)
+        np.save(f"{self.save_dir}/X_test.npy", X_test)
+        np.save(f"{self.save_dir}/y_test.npy", y_test)
+        dump(self.scaler_y, f"{self.save_dir}/scaler_y.pkl")
+
+     
+        print(f"✅ IMF滑窗构造完成（不含第T+1天特征）！window_size={self.window_size}")
+        print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+        print(f"X_val   shape: {X_val.shape}, y_val   shape: {y_val.shape}")
+        print(f"X_test  shape: {X_test.shape}, y_test  shape: {y_test.shape}")
+        print(f"✅ 所有数据与 scaler_y.pkl 已保存至 {self.save_dir}/")
+
+if __name__ == "__main__":
+    loader = SlidingWindowDataLoaderSimple(
+        file_path="PCA_Selected_Data.csv",  
+        target_col="IMF_2",
+        window_size=8,
+        save_dir="npy_data"
+    )
+    loader.process_and_save()
