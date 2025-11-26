@@ -1,0 +1,64 @@
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+
+df = pd.read_csv("CSV_Features/ICEEMDAN_Combined_Features.csv", parse_dates=["timestamp"], index_col="timestamp")
+df = df.sort_index()
+
+
+all_columns = df.columns.tolist()
+imf_columns = [col for col in all_columns if col.startswith("IMF_") or col == "Residue"]
+original_feature_columns = [col for col in all_columns if col not in imf_columns + ["tsd"]]
+
+
+df_imfs = df[imf_columns]
+df_features = df[original_feature_columns]
+df_target = df["tsd"] if "tsd" in df.columns else None
+
+
+scaler = StandardScaler()
+scaled_features = scaler.fit_transform(df_features)
+
+
+pca_temp = PCA()
+pca_temp.fit(scaled_features)
+cumulative_variance = np.cumsum(pca_temp.explained_variance_ratio_)
+num_components_98 = np.argmax(cumulative_variance >= 0.98) + 1
+print(f"📌 要达到 98% 累计解释方差，需保留主成分个数: {num_components_98}")
+
+
+pca = PCA(n_components=num_components_98)
+principal_components = pca.fit_transform(scaled_features)
+pca_columns = [f"PC{i+1}" for i in range(num_components_98)]
+df_pca = pd.DataFrame(principal_components, index=df.index, columns=pca_columns)
+
+
+df_combined = pd.concat([df_imfs, df_pca], axis=1)
+if df_target is not None:
+    df_combined["tsd"] = df_target
+
+
+os.makedirs("PCA_Output", exist_ok=True)
+output_path = "PCA_Output/PCA_Selected_With_IMFs.csv"
+df_combined.to_csv(output_path)
+print(f"✅ Final PCA + IMF Data saved to: {output_path}")
+loading_matrix = pd.DataFrame(pca.components_.T, index=original_feature_columns, columns=pca_columns)
+
+plt.figure(figsize=(14, 8))
+sns.heatmap(loading_matrix, annot=True, fmt=".2f", cmap="coolwarm", center=0)
+plt.title("PCA Loadings: Original Features vs Principal Components")
+plt.xlabel("Principal Components")
+plt.ylabel("Original Raw Features")
+plt.tight_layout()
+plt.savefig("PCA_Output/PCA_Loading_Heatmap_IMFsKept.png")
+plt.show()
+
+
+explained_variance = pca.explained_variance_ratio_
+print("📊 Explained variance ratio:", explained_variance)
+print("📈 Cumulative variance ratio:", np.cumsum(explained_variance))
