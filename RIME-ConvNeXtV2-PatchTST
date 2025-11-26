@@ -1,0 +1,300 @@
+import os, random, copy, math
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from joblib import load
+
+def seed_everything(seed=42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+seed_everything()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+X_train = np.load("npy_data/X_train.npy")
+y_train = np.load("npy_data/y_train.npy")
+X_val = np.load("npy_data/X_val.npy")
+y_val = np.load("npy_data/y_val.npy")
+X_test = np.load("npy_data/X_test.npy")
+y_test = np.load("npy_data/y_test.npy")
+scaler_y = load("npy_data/scaler_y.pkl")
+
+torch_X_train = torch.tensor(X_train, dtype=torch.float32)
+torch_y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
+torch_X_val = torch.tensor(X_val, dtype=torch.float32)
+torch_y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
+torch_X_test = torch.tensor(X_test, dtype=torch.float32)
+torch_y_test = torch.tensor(y_test, dtype=torch.float32).unsqueeze(-1)
+
+
+class ConvNeXtV2Block1D(nn.Module):
+    def __init__(self, dim, layer_scale_init_value=1e-6, drop_path=0.0):
+        super().__init__()
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim))) if layer_scale_init_value > 0 else None
+        self.drop_path = nn.Identity() if drop_path == 0.0 else nn.Dropout(drop_path)
+
+    def forward(self, x):
+        shortcut = x
+        x = x.permute(0, 2, 1)
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 1)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        return shortcut + self.drop_path(x)
+
+class ConvNeXtV2Encoder1D(nn.Module):
+    def __init__(self, input_dim, d_model=64, depth=4, drop_path_rate=0.1):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, d_model)
+        self.blocks = nn.Sequential(*[
+            ConvNeXtV2Block1D(d_model, drop_path=drop_path_rate)
+            for _ in range(depth)
+        ])
+    def forward(self, x):
+        x = self.proj(x)
+        x = self.blocks(x)
+        return x
+
+class ConvNeXtV2_PatchTST(nn.Module):
+    def __init__(self, input_dim, patch_len=8, stride=4, d_model=64, conv_depth=4,
+                 trans_layers=2, dropout=0.1, max_patches=100):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.encoder = ConvNeXtV2Encoder1D(input_dim, d_model, conv_depth)
+        self.patch_embed = nn.Linear(patch_len * d_model, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_patches, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=4, dim_feedforward=128,
+                                                   dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=trans_layers)
+        self.head = nn.Linear(d_model, 2)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        B, T, C = x.shape
+        patches = [x[:, i:i+self.patch_len, :].reshape(B, -1)
+                   for i in range(0, T - self.patch_len + 1, self.stride)]
+        x_patch = torch.stack(patches, dim=1)
+        x_embed = self.patch_embed(x_patch) + self.pos_embed[:, :x_patch.size(1), :]
+        x_enc = self.transformer(x_embed)
+        return self.head(x_enc.mean(dim=1))
+
+def gaussian_nll_loss(output, target):
+    mean, log_var = output[:, 0], output[:, 1]
+    var = torch.exp(log_var)
+    return torch.mean((target.squeeze() - mean)**2 / var + log_var)
+
+
+def evaluate_metrics(y_true, y_pred):
+    return mean_absolute_error(y_true, y_pred), mean_squared_error(y_true, y_pred, squared=False), r2_score(y_true, y_pred)
+
+def fitness_score(mae, rmse, r2, alpha=0.5, beta=0.5):
+    return (1 / (mae + 1e-6))**alpha * (max(r2, 0) + 1e-6)**beta / (rmse + 1e-6)
+
+
+def train_validate(model, train_loader, val_loader, optimizer, criterion, epochs=50, patience=10):
+    best_loss = float('inf'); best_state = copy.deepcopy(model.state_dict()); counter = 0
+    for epoch in range(epochs):
+        model.train(); total_loss = 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad(); loss = criterion(model(xb), yb)
+            loss.backward(); optimizer.step()
+            total_loss += loss.item() * xb.size(0)
+        total_loss /= len(train_loader.dataset)
+
+        model.eval(); val_loss = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                val_loss += criterion(model(xb), yb).item() * xb.size(0)
+        val_loss /= len(val_loader.dataset)
+
+        if val_loss < best_loss:
+            best_loss = val_loss; best_state = copy.deepcopy(model.state_dict()); counter = 0
+        else:
+            counter += 1
+            if counter >= patience: break
+    model.load_state_dict(best_state)
+
+
+def rime_search(input_dim, train_X, train_y, val_X, val_y, pop=15, max_gen=20, top_k=5, elite_memory=10, gamma=0.1, freeze_thresh=5, robust_rounds=2):
+    def sample_config():
+        return {
+            'patch_len': random.choice([4, 6,8]),
+            'stride': random.choice([2, 4,6]),
+            'd_model': random.choice([32, 64,96,128]),
+            'conv_depth': random.choice([2, 4,6]),
+            'trans_layers': random.choice([1, 2,3,4]),
+            'dropout': round(random.uniform(0.05, 0.4), 3),
+            'lr': 10 ** np.random.uniform(-4, -2),
+            'batch_size': random.choice([16,32, 64,128])
+        }
+
+    def perturb(cfg, freeze):
+        new = cfg.copy()
+        for k in cfg:
+            if freeze.get(k, 0) >= freeze_thresh: continue
+            if k == 'lr':
+                log_val = np.log(cfg[k]) + np.random.normal()
+                new[k] = float(np.clip(np.exp(log_val), 1e-5, 1e-1))
+            elif k == 'dropout':
+                val = cfg[k] + np.random.normal(scale=0.05)
+                new[k] = float(np.clip(val, 0.01, 0.5))
+            else:
+                space = {
+                    'patch_len': [4, 6, 8],
+                    'stride': [2, 4,6],
+                    'd_model': [32, 64,96,128],
+                    'conv_depth': [2, 4,6],
+                    'trans_layers': [1, 2,3,4],
+                    'batch_size': [16,32, 64,128]
+                }[k]
+                idx = space.index(cfg[k])
+                step = int(np.round(np.random.normal()))
+                new[k] = space[max(0, min(len(space) - 1, idx + step))]
+        return new
+
+    def evaluate_config(cfg):
+      
+        model_params = {k: cfg[k] for k in ['patch_len', 'stride', 'd_model', 'conv_depth', 'trans_layers', 'dropout']}
+        scores = []
+
+        for _ in range(robust_rounds):
+            model = ConvNeXtV2_PatchTST(input_dim, **model_params).to(device)
+            optimizer = optim.Adam(model.parameters(), lr=cfg['lr'])
+
+            tr_loader = DataLoader(TensorDataset(train_X, train_y), batch_size=cfg['batch_size'], shuffle=True)
+            vl_loader = DataLoader(TensorDataset(val_X, val_y), batch_size=cfg['batch_size'])
+
+            train_validate(model, tr_loader, vl_loader, optimizer, gaussian_nll_loss)
+
+            with torch.no_grad():
+                out = model(val_X.to(device))
+                mean = out[:, 0].cpu().numpy()
+                y_true = val_y.cpu().numpy()
+                scores.append(evaluate_metrics(y_true, mean))
+
+        avg = np.mean(scores, axis=0)
+        return fitness_score(*avg), avg, cfg
+
+    population = [sample_config() for _ in range(pop)]
+    memory, freeze, history = [], {}, []
+
+    for gen in range(max_gen):
+        results = [evaluate_config(cfg) for cfg in population]
+        results.sort(key=lambda x: x[0], reverse=True)
+        memory += results[:top_k]
+        memory = sorted(memory, key=lambda x: x[0], reverse=True)[:elite_memory]
+        best_fit, best_score, best_cfg = memory[0]
+
+        for k in best_cfg:
+            same = all(cfg[k] == best_cfg[k] for _, _, cfg in results)
+            freeze[k] = freeze.get(k, 0) + int(same)
+
+        history.append({'generation': gen + 1, 'fitness': best_fit, 'MAE': best_score[0], 'RMSE': best_score[1],
+                        'R2': best_score[2], 'config': best_cfg})
+        print(f"[Gen {gen + 1:02d}] R²={best_score[2]:.4f} | RMSE={best_score[1]:.4f} | {best_cfg}")
+        new_pop = [sample_config() if random.random() < gamma else perturb(random.choice(memory)[2], freeze) for _ in
+                   range(pop)]
+        population = new_pop
+
+    pd.DataFrame(history).to_csv("train_results/RIME_ConvNeXtV2_PatchTST/search_log.csv", index=False)
+    return history[-1]['config']
+
+
+
+os.makedirs("train_results/RIME_ConvNeXtV2_PatchTST/results", exist_ok=True)
+
+
+best_cfg = rime_search(X_train.shape[2], torch_X_train, torch_y_train, torch_X_val, torch_y_val)
+
+
+model_params = {k: best_cfg[k] for k in ['patch_len', 'stride', 'd_model', 'conv_depth', 'trans_layers', 'dropout']}
+model = ConvNeXtV2_PatchTST(input_dim=X_train.shape[2], **model_params).to(device)
+optimizer = optim.Adam(model.parameters(), lr=best_cfg['lr'])
+
+
+train_loader = DataLoader(TensorDataset(torch_X_train, torch_y_train), batch_size=best_cfg['batch_size'], shuffle=True)
+val_loader = DataLoader(TensorDataset(torch_X_val, torch_y_val), batch_size=best_cfg['batch_size'])
+test_loader = DataLoader(TensorDataset(torch_X_test, torch_y_test), batch_size=best_cfg['batch_size'])
+
+
+train_validate(model, train_loader, val_loader, optimizer, gaussian_nll_loss)
+
+
+def predict(model, X, n_samples=30):
+    model.eval(); preds = []
+    for _ in range(n_samples):
+        with torch.no_grad():
+            out = model(X.to(device))
+            mean, log_var = out[:, 0], out[:, 1]
+            std = torch.exp(0.5 * log_var)
+            sampled = torch.normal(mean, std)
+            preds.append(sampled.cpu().numpy())
+    return np.mean(preds, axis=0)
+
+
+train_pred = predict(model, torch_X_train)
+val_pred = predict(model, torch_X_val)
+test_pred = predict(model, torch_X_test)
+
+
+train_pred_inv = scaler_y.inverse_transform(train_pred.reshape(-1, 1))
+val_pred_inv = scaler_y.inverse_transform(val_pred.reshape(-1, 1))
+test_pred_inv = scaler_y.inverse_transform(test_pred.reshape(-1, 1))
+y_train_inv = scaler_y.inverse_transform(y_train.reshape(-1, 1))
+y_val_inv = scaler_y.inverse_transform(y_val.reshape(-1, 1))
+y_test_inv = scaler_y.inverse_transform(y_test.reshape(-1, 1))
+
+
+def calc_metrics(y_true, y_pred):
+    return (
+        mean_absolute_error(y_true, y_pred),
+        mean_squared_error(y_true, y_pred, squared=False),
+        r2_score(y_true, y_pred)
+    )
+
+train_m = calc_metrics(y_train_inv, train_pred_inv)
+val_m = calc_metrics(y_val_inv, val_pred_inv)
+test_m = calc_metrics(y_test_inv, test_pred_inv)
+
+
+pd.DataFrame({
+    "Dataset": ["Train", "Val", "Test"],
+    "MAE": [train_m[0], val_m[0], test_m[0]],
+    "RMSE": [train_m[1], val_m[1], test_m[1]],
+    "R2": [train_m[2], val_m[2], test_m[2]]
+}).to_csv("train_results/RIME_ConvNeXtV2_PatchTST/results/evaluation.csv", index=False)
+
+
+pd.DataFrame({'y_true_test': y_test_inv.flatten(), 'y_pred_test': test_pred_inv.flatten()}).to_csv(
+    "train_results/RIME_ConvNeXtV2_PatchTST/results/test_pred_vs_true.csv", index=False)
+
+
+plt.figure(figsize=(10, 5))
+plt.plot(y_test_inv, label='True')
+plt.plot(test_pred_inv, label='Pred')
+plt.title("Test Prediction vs True")
+plt.legend(); plt.tight_layout()
+plt.savefig("train_results/RIME_ConvNeXtV2_PatchTST/results/test_pred_vs_true.png")
+plt.close()
+
+
+print("✅ 训练 + 搜索 + 预测完成")
+print(f"🎯 Train: MAE={train_m[0]:.4f}, RMSE={train_m[1]:.4f}, R²={train_m[2]:.4f}")
+print(f"🎯 Val:   MAE={val_m[0]:.4f}, RMSE={val_m[1]:.4f}, R²={val_m[2]:.4f}")
+print(f"🎯 Test:  MAE={test_m[0]:.4f}, RMSE={test_m[1]:.4f}, R²={test_m[2]:.4f}")
